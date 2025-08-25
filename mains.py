@@ -3,335 +3,394 @@ import os
 import sys
 import random
 import time
-import torch
-import cv2
+import json
 import math
 import numpy as np
+
+import torch
 import torch.backends.cudnn as cudnn
 from torch.optim import Adam
 from torch.utils.data import DataLoader
-from tensorboardX import SummaryWriter
-from torchnet import meter
-import utils
-import json
+from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 
-from data import HSTrainingData
-from data import HSTestData
+from data import HSTrainingData, HSTestData
 from SSPSR import SSPSR
 from common import *
-
-# loss
 from loss import HybridLoss
-# from loss import HyLapLoss
 from metrics import quality_assessment
 
-# global settings
-resume = True
-log_interval = 50
-model_name = ''
-test_data_dir = ''
 
-def main():
-    # parsers
-    main_parser = argparse.ArgumentParser(description="parser for SR network")
-    subparsers = main_parser.add_subparsers(title="subcommands", dest="subcommand")
-    train_parser = subparsers.add_parser("train", help="parser for training arguments")
-    train_parser.add_argument("--cuda", type=int, required=False,default=1,
-                              help="set it to 1 for running on GPU, 0 for CPU")
-    train_parser.add_argument("--colors", type=int, default=32, help="band size, default set to 32")                          
-    train_parser.add_argument("--batch_size", type=int, default=32, help="batch size, default set to 64")
-    train_parser.add_argument("--epochs", type=int, default=40, help="epochs, default set to 20")
-    train_parser.add_argument("--n_feats", type=int, default=256, help="n_feats, default set to 256")
-    train_parser.add_argument("--n_blocks", type=int, default=3, help="n_blocks, default set to 6")
-    train_parser.add_argument("--n_subs", type=int, default=8, help="n_subs, default set to 8")
-    train_parser.add_argument("--n_ovls", type=int, default=2, help="n_ovls, default set to 1")
-    train_parser.add_argument("--n_scale", type=int, default=4, help="n_scale, default set to 2")
-    train_parser.add_argument("--use_share", type=bool, default=True, help="f_share, default set to 1")
-    train_parser.add_argument("--dataset_name", type=str, default="Chikusei", help="dataset_name, default set to dataset_name")
-    train_parser.add_argument("--model_title", type=str, default="SSPSR", help="model_title, default set to model_title")
-    train_parser.add_argument("--seed", type=int, default=3000, help="start seed for model")
-    train_parser.add_argument("--learning_rate", type=float, default=1e-4,
-                              help="learning rate, default set to 1e-4")
-    train_parser.add_argument("--weight_decay", type=float, default=0, help="weight decay, default set to 0")
-    train_parser.add_argument("--save_dir", type=str, default="./trained_model/",
-                              help="directory for saving trained models, default is trained_model folder")
-    train_parser.add_argument("--gpus", type=str, default="1", help="gpu ids (default: 7)")
+# ---------------------------
+# Utils
+# ---------------------------
+class AverageMeter:
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+    def reset(self):
+        self.val = 0.0
+        self.avg = 0.0
+        self.sum = 0.0
+        self.cnt = 0
+    def update(self, val, n=1):
+        self.val = float(val)
+        self.sum += float(val) * n
+        self.cnt += n
+        self.avg = self.sum / self.cnt if self.cnt > 0 else 0.0
 
-    test_parser = subparsers.add_parser("test", help="parser for testing arguments")
-    test_parser.add_argument("--cuda", type=int, required=False,default=1,
-                             help="set it to 1 for running on GPU, 0 for CPU")
-    test_parser.add_argument("--gpus", type=str, default="0,1", help="gpu ids (default: 7)")
-    # test_parser.add_argument("--test_dir", type=str, required=True, help="directory of testset")
-    # test_parser.add_argument("--model_dir", type=str, required=True, help="directory of trained model")
 
-    args = main_parser.parse_args()
-    print(args.gpus)
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
-    if args.subcommand is None:
-        print("ERROR: specify either train or test")
-        sys.exit(1)
-    if args.cuda and not torch.cuda.is_available():
-        print("ERROR: cuda is not available, try running on CPU")
-        sys.exit(1)
-    if args.subcommand == "train":
-        train(args)
+def set_seed(seed: int, deterministic: bool = False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        cudnn.deterministic = True
+        cudnn.benchmark = False
     else:
-        test(args)
-    pass
+        cudnn.benchmark = True
 
-def train(args):
-    device = torch.device("cuda" if args.cuda else "cpu")
-    # args.seed = random.randint(1, 10000)
-    print("Start seed: ", args.seed)
-    torch.manual_seed(args.seed)
-    if args.cuda:
-        torch.cuda.manual_seed(args.seed)
-    cudnn.benchmark = True
-    print('===> Loading datasets')
-    train_path    = './dataset/'+args.dataset_name+'_x'+str(args.n_scale)+'/trains/'
-    eval_path     = './dataset/'+args.dataset_name+'_x'+str(args.n_scale)+'/evals/'
-    result_path   = './dataset/'+args.dataset_name+'_x'+str(args.n_scale)+'/tests/'
-    test_data_dir = './dataset/'+args.dataset_name+'_x'+str(args.n_scale)+'/Cave_test.mat'
-    test_data_dir = './dataset/Cave_x'+str(args.n_scale)+'/Cave_test.mat'
-    
-    print(train_path)
-    train_set = HSTrainingData(image_dir=train_path, colors=args.colors, augment=True)
-    eval_set = HSTrainingData(image_dir=eval_path, colors=args.colors, augment=False)
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, num_workers=8, shuffle=True)
-    eval_loader = DataLoader(eval_set, batch_size=args.batch_size, num_workers=4, shuffle=False)
-
-
-    if args.dataset_name=='Cave':
-        colors = args.colors
-    elif args.dataset_name=='Pavia':
-        colors = 102
-    else:
-        colors = args.colors 
-    
-    print('===> Building model for ' + str(colors) + ' bands')
-    net = SSPSR(n_subs=args.n_subs, n_ovls=args.n_ovls, n_colors=colors, n_blocks=args.n_blocks, n_feats=args.n_feats, n_scale=args.n_scale, res_scale=0.1, use_share=args.use_share, conv=default_conv)
-    # print(net)  
-    model_title = args.dataset_name + "_" + args.model_title +'_Blocks='+str(args.n_blocks)+'_Subs'+str(args.n_subs)+'_Ovls'+str(args.n_ovls)+'_Feats='+str(args.n_feats)
-    model_name = './checkpoints/Chikusei_' + model_title + "_ckpt_epoch_" + str(40) + ".pth"
-    args.model_title = model_title
-    
-    if torch.cuda.device_count() > 1:
-        print("===> Let's use", torch.cuda.device_count(), "GPUs.")
-        net = torch.nn.DataParallel(net)
-    start_epoch = 0
-    if resume:
-        if os.path.isfile(model_name):
-            print("=> loading checkpoint '{}'".format(model_name))
-            checkpoint = torch.load(model_name)
-            start_epoch = checkpoint["epoch"]
-            net.load_state_dict(checkpoint["model"].state_dict())
-        else:
-            print("=> no checkpoint found at '{}'".format(model_name))
-    net.to(device).train()
-
-    # loss functions to choose
-    # mse_loss = torch.nn.MSELoss()
-    h_loss = HybridLoss(spatial_tv=True, spectral_tv=True)
-    # hylap_loss = HyLapLoss(spatial_tv=False, spectral_tv=True)
-    L1_loss = torch.nn.L1Loss()
-
-    print("===> Setting optimizer and logger")
-    # add L2 regularization
-    optimizer = Adam(net.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    epoch_meter = meter.AverageValueMeter()
-    writer = SummaryWriter('runs/'+model_title+'_'+str(time.ctime()))
-    
-    print('===> Start training')
-    for e in range(start_epoch, args.epochs):
-        adjust_learning_rate(args.learning_rate, optimizer, e+1)
-        epoch_meter.reset()
-        print("Start epoch {}, learning rate = {}".format(e + 1, optimizer.param_groups[0]["lr"]))
-        for iteration, (x, lms, gt) in enumerate(train_loader):
-            x, lms, gt = x.to(device), lms.to(device), gt.to(device)
-            optimizer.zero_grad()       
-            y = net(x, lms)
-            loss = h_loss(y, gt)
-            epoch_meter.add(loss.item())
-            loss.backward()
-            # torch.nn.utils.clip_grad_norm(net.parameters(), clip_para)
-            optimizer.step()
-            # tensorboard visualization
-            if (iteration + log_interval) % log_interval == 0:
-                print("===> {} B{} Sub{} Fea{} GPU{}\tEpoch[{}]({}/{}): Loss: {:.6f}".format(time.ctime(), args.n_blocks, args.n_subs, args.n_feats, args.gpus, e+1, iteration + 1,
-                                                                   len(train_loader), loss.item()))
-                n_iter = e * len(train_loader) + iteration + 1
-                writer.add_scalar('scalar/train_loss', loss, n_iter)
-
-        print("===> {}\tEpoch {} Training Complete: Avg. Loss: {:.6f}".format(time.ctime(), e+1, epoch_meter.value()[0]))
-        # run validation set every epoch
-        eval_loss = validate(args, eval_loader, net, L1_loss)
-        # Check if the validation loss has improved
-        best_val_loss = 0
-        early_stopping = True
-        patience = 5
-        counter = 0
-        if eval_loss < best_val_loss:
-            best_val_loss = eval_loss
-            counter = 0  # Reset the counter
-            save_checkpoint(args, net, e + 1)
-        else:
-            counter += 1
-        # Check if early stopping criteria are met
-        if early_stopping and counter >= patience:
-            print("Early stopping! No improvement for {} epochs.".format(patience))
-            break
-        # tensorboard visualization
-        writer.add_scalar('scalar/avg_epoch_loss', epoch_meter.value()[0], e + 1)
-        writer.add_scalar('scalar/avg_validation_loss', eval_loss, e + 1)
-        # save model weights at checkpoints every 10 epochs
-        if (e + 1) % 5 == 0:
-            save_checkpoint(args, net, e+1)
-
-    # save model after training
-    net.eval().cpu()
-    save_model_filename = model_title + "_epoch_" + str(args.epochs) + "_" + \
-                          str(time.ctime()).replace(' ', '_') + ".pth"
-    save_model_path = os.path.join(args.save_dir, save_model_filename)
-    if torch.cuda.device_count() > 1:
-        torch.save(net.module.state_dict(), save_model_path)
-    else:
-        torch.save(net.state_dict(), save_model_path)
-    print("\nDone, trained model saved at", save_model_path)
-
-
-    ## Save the testing results
-    results = []
-    print("Running testset")
-    print('===> Loading testset')
-    test_set = HSTestData(test_data_dir, colors=args.colors)
-    test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
-    print('===> Start testing')
-    net.eval().cuda()
-    with torch.no_grad():
-        output = []
-        test_number = 0
-        mat = [4, 7,3]
-        for i, (ms, lms, gt) in enumerate(test_loader):
-            ms, lms, gt = ms.to(device), lms.to(device), gt.to(device)
-            y = net(ms, lms)
-            yn = y.view(512, 512, 8)
-            xn = ms.view(64, 64, 8)
-            lmsn = lms.view(512, 512, 8)
-            gtsn = gt.view(512, 512, 8)
-            print("Iteration")
-            plt.imshow(gt.squeeze().cpu().numpy().transpose(1, 2, 0)[:,:,mat])
-            plt.savefig('result/gt.png')
-            plt.imshow(ms.squeeze().cpu().numpy().transpose(1, 2, 0)[:,:,mat])
-            plt.savefig('result/ms.png')
-            plt.imshow(y.detach().squeeze().cpu().numpy().transpose(1, 2, 0)[:,:,mat])
-            plt.savefig('result/y.png')
-            y, gt = y.squeeze().cpu().numpy().transpose(1, 2, 0), gt.squeeze().cpu().numpy().transpose(1, 2, 0)
-            y = y[:gt.shape[0],:gt.shape[1],:] 
-            
-            if i==0:
-                indices = quality_assessment(gt, y, data_range=1., ratio=4)
-            else:
-                indices = sum_dict(indices, quality_assessment(gt, y, data_range=1., ratio=4))
-            output.append(y)
-            test_number += 1
-        for index in indices:
-            indices[index] = indices[index] / test_number
-
-    save_dir = "result/test.npy"
-    # save_dir = model_title + '.npy'
-    np.save(save_dir, output)
-    print("Test finished, test results saved to .npy file at ", save_dir)
-    print(indices)
-
-    QIstr = model_title+'_'+str(time.ctime())+ ".txt"
-    json.dump(indices, open(QIstr, 'w'))
 
 def sum_dict(a, b):
     temp = dict()
-    for key in a.keys()| b.keys():
+    for key in a.keys() | b.keys():
         temp[key] = sum([d.get(key, 0) for d in (a, b)])
     return temp
 
+
 def adjust_learning_rate(start_lr, optimizer, epoch):
-    """Sets the learning rate to the initial LR decayed by 10 every 50 epochs"""
+    """Decay LR by 10x every 10 epochs."""
     lr = start_lr * (0.1 ** (epoch // 10))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
 
-def validate(args, loader, model, criterion):
-    device = torch.device("cuda" if args.cuda else "cpu")
-    # switch to evaluate mode
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+# ---------------------------
+# Main
+# ---------------------------
+def build_argparser():
+    main_parser = argparse.ArgumentParser(description="SSPSR Hyperspectral Super-Resolution")
+    subparsers = main_parser.add_subparsers(title="subcommands", dest="subcommand")
+
+    # Shared / common
+    main_parser.add_argument("--gpus", type=str, default="0", help="CUDA visible device ids (e.g., '0' or '0,1')")
+    main_parser.add_argument("--cuda", type=int, default=1, help="1=GPU (if available), 0=CPU")
+    main_parser.add_argument("--seed", type=int, default=3000, help="random seed")
+    main_parser.add_argument("--deterministic", action="store_true", help="enable cudnn deterministic (slower)")
+
+    # Paths
+    main_parser.add_argument("--data_root", type=str, default="./dataset", help="root folder containing datasets")
+    main_parser.add_argument("--result_dir", type=str, default="./result", help="folder to save results/plots/npys")
+    main_parser.add_argument("--save_dir", type=str, default="./trained_model", help="folder to save final models")
+    main_parser.add_argument("--resume", type=str, default="", help="path to checkpoint .pth to resume training")
+    main_parser.add_argument("--weights", type=str, default="", help="path to weights/ckpt for testing")
+
+    # Train
+    train_parser = subparsers.add_parser("train", help="training")
+    train_parser.add_argument("--dataset_name", type=str, default="Chikusei", choices=["Chikusei", "Cave", "Pavia"])
+    train_parser.add_argument("--n_scale", type=int, default=4, help="upscale factor")
+    train_parser.add_argument("--colors", type=int, default=32, help="number of spectral bands used in training")
+    train_parser.add_argument("--batch_size", type=int, default=32)
+    train_parser.add_argument("--epochs", type=int, default=40)
+    train_parser.add_argument("--learning_rate", type=float, default=1e-4)
+    train_parser.add_argument("--weight_decay", type=float, default=0.0)
+    train_parser.add_argument("--n_feats", type=int, default=256)
+    train_parser.add_argument("--n_blocks", type=int, default=3)
+    train_parser.add_argument("--n_subs", type=int, default=8)
+    train_parser.add_argument("--n_ovls", type=int, default=2)
+    train_parser.add_argument("--use_share", type=bool, default=True)
+    train_parser.add_argument("--model_title", type=str, default="SSPSR")
+    train_parser.add_argument("--log_interval", type=int, default=50)
+
+    # Test
+    test_parser = subparsers.add_parser("test", help="testing/evaluation")
+    test_parser.add_argument("--dataset_name", type=str, default="Cave", choices=["Chikusei", "Cave", "Pavia"])
+    test_parser.add_argument("--n_scale", type=int, default=4)
+    test_parser.add_argument("--colors", type=int, default=32)
+
+    return main_parser
+
+
+def main():
+    parser = build_argparser()
+    args = parser.parse_args()
+
+    # Device
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
+    use_cuda = bool(args.cuda) and torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+
+    # Seed
+    set_seed(args.seed, deterministic=args.deterministic)
+
+    # Command
+    if args.subcommand is None:
+        print("ERROR: specify either 'train' or 'test'")
+        sys.exit(1)
+
+    if args.subcommand == "train":
+        train(args, device)
+    else:
+        test(args, device)
+
+
+# ---------------------------
+# Train
+# ---------------------------
+def train(args, device):
+    print(f"Device: {device}")
+    print(f"Seed: {args.seed}")
+
+    # Paths
+    split_root = os.path.join(args.data_root, f"{args.dataset_name}_x{args.n_scale}")
+    train_path  = os.path.join(split_root, "trains")
+    eval_path   = os.path.join(split_root, "evals")
+    result_path = ensure_dir(os.path.join(args.result_dir, f"{args.dataset_name}_x{args.n_scale}"))
+    ensure_dir(args.save_dir)
+    ensure_dir("./checkpoints")
+
+    # Datasets/Loaders
+    print('===> Loading datasets')
+    train_set = HSTrainingData(image_dir=train_path, colors=args.colors, augment=True)
+    eval_set  = HSTrainingData(image_dir=eval_path,  colors=args.colors, augment=False)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, num_workers=8, shuffle=True)
+    eval_loader  = DataLoader(eval_set,  batch_size=args.batch_size, num_workers=4, shuffle=False)
+
+    # Colors adjustment by dataset
+    if args.dataset_name == 'Cave':
+        colors = args.colors
+    elif args.dataset_name == 'Pavia':
+        colors = 102
+    else:
+        colors = args.colors
+
+    # Model
+    print(f'===> Building model for {colors} bands')
+    net = SSPSR(
+        n_subs=args.n_subs, n_ovls=args.n_ovls, n_colors=colors,
+        n_blocks=args.n_blocks, n_feats=args.n_feats, n_scale=args.n_scale,
+        res_scale=0.1, use_share=args.use_share, conv=default_conv
+    )
+
+    if torch.cuda.device_count() > 1 and device.type == "cuda":
+        print("===> Using", torch.cuda.device_count(), "GPUs.")
+        net = torch.nn.DataParallel(net)
+
+    net = net.to(device)
+
+    # Title / checkpoints
+    model_title = f"{args.dataset_name}_{args.model_title}_Blocks={args.n_blocks}_Subs{args.n_subs}_Ovls{args.n_ovls}_Feats={args.n_feats}"
+    args.model_title = model_title
+
+    start_epoch = 0
+    if args.resume and os.path.isfile(args.resume):
+        print(f"=> Resuming from checkpoint '{args.resume}'")
+        checkpoint = torch.load(args.resume, map_location=device)
+        start_epoch = checkpoint.get("epoch", 0)
+        # checkpoint saved as {"epoch": e, "model": model}; handle DP vs non-DP
+        state_model = checkpoint["model"].state_dict() if hasattr(checkpoint["model"], "state_dict") else checkpoint["model"]
+        net.load_state_dict(state_model)
+    else:
+        print("=> Training from scratch")
+
+    # Loss / Optim / Log
+    h_loss = HybridLoss(spatial_tv=True, spectral_tv=True)
+    L1_loss = torch.nn.L1Loss()
+    optimizer = Adam(net.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    writer = SummaryWriter(f"runs/{model_title}_{time.strftime('%Y%m%d_%H%M%S')}")
+
+    print('===> Start training')
+    best_val_loss = float('inf')         # FIX 1: correct initialization
+    patience = 5
+    counter = 0
+
+    for e in range(start_epoch, args.epochs):
+        adjust_learning_rate(args.learning_rate, optimizer, e + 1)
+        batch_loss_meter = AverageMeter()
+
+        print(f"Start epoch {e + 1}, lr = {optimizer.param_groups[0]['lr']}")
+        net.train()
+        for iteration, (x, lms, gt) in enumerate(train_loader):
+            x, lms, gt = x.to(device), lms.to(device), gt.to(device)
+            optimizer.zero_grad()
+            y = net(x, lms)
+            loss = h_loss(y, gt)
+            loss.backward()
+            optimizer.step()
+
+            batch_loss_meter.update(loss.item())
+            # logging
+            if (iteration + 1) % args.log_interval == 0:
+                print(f"===> {time.ctime()} B{args.n_blocks} Sub{args.n_subs} Fea{args.n_feats} GPU{args.gpus}\t"
+                      f"Epoch[{e + 1}]({iteration + 1}/{len(train_loader)}): Loss: {loss.item():.6f}")
+                n_iter = e * len(train_loader) + iteration + 1
+                writer.add_scalar('train/loss', loss.item(), n_iter)
+
+        print(f"===> {time.ctime()}\tEpoch {e + 1} Training Complete: Avg. Loss: {batch_loss_meter.avg:.6f}")
+
+        # Validation
+        eval_loss = validate(args, eval_loader, net, L1_loss, device)
+        writer.add_scalar('val/loss', eval_loss, e + 1)
+        writer.add_scalar('train/avg_epoch_loss', batch_loss_meter.avg, e + 1)
+
+        # Early stopping & checkpointing  (FIX 1)
+        if eval_loss < best_val_loss:
+            best_val_loss = eval_loss
+            counter = 0
+            save_checkpoint(args, net, e + 1)
+        else:
+            counter += 1
+            if counter >= patience:
+                print(f"Early stopping at epoch {e + 1} (no improvement for {patience} epochs).")
+                break
+
+        # Periodic checkpoint
+        if (e + 1) % 5 == 0:
+            save_checkpoint(args, net, e + 1)
+
+    # Save final model
+    net.eval().cpu()
+    ensure_dir(args.save_dir)
+    save_model_filename = f"{model_title}_epoch_{args.epochs}_{time.strftime('%Y%m%d_%H%M%S')}.pth"
+    save_model_path = os.path.join(args.save_dir, save_model_filename)
+    if isinstance(net, torch.nn.DataParallel):
+        torch.save(net.module.state_dict(), save_model_path)
+    else:
+        torch.save(net.state_dict(), save_model_path)
+    print("\nDone, trained model saved at", save_model_path)
+
+    # Optional quick test on held-out set path (if present)
+    test_data_dir = os.path.join(args.data_root, f"{args.dataset_name}_x{args.n_scale}", "Cave_test.mat")
+    if os.path.isfile(test_data_dir):
+        print("Running quick testset evaluation...")
+        run_test_loop(net.to(device), args, device, test_data_dir, result_path)
+
+
+# ---------------------------
+# Validate
+# ---------------------------
+def validate(args, loader, model, criterion, device):
     model.eval()
-    epoch_meter = meter.AverageValueMeter()
-    epoch_meter.reset()
+    meter = AverageMeter()
     with torch.no_grad():
         for i, (ms, lms, gt) in enumerate(loader):
             ms, lms, gt = ms.to(device), lms.to(device), gt.to(device)
-            # y = model(ms)            
             y = model(ms, lms)
             loss = criterion(y, gt)
-            epoch_meter.add(loss.item())
-        mesg = "===> {}\tEpoch evaluation Complete: Avg. Loss: {:.6f}".format(time.ctime(), epoch_meter.value()[0])
-        print(mesg)
-    # back to training mode
+            meter.update(loss.item())
+    print(f"===> {time.ctime()}\tEpoch evaluation Complete: Avg. Loss: {meter.avg:.6f}")
     model.train()
-    return epoch_meter.value()[0]
+    return meter.avg
 
-def test(args):
-    device = torch.device("cuda" if args.cuda else "cpu")
+
+# ---------------------------
+# Test
+# ---------------------------
+def test(args, device):
+    # Paths
+    result_path = ensure_dir(os.path.join(args.result_dir, f"{args.dataset_name}_x{args.n_scale}"))
+    test_data_dir = os.path.join(args.data_root, f"{args.dataset_name}_x{args.n_scale}", "Cave_test.mat")
+
+    if not args.weights or not os.path.isfile(args.weights):
+        print("ERROR: please provide a valid --weights path to a trained checkpoint/state_dict (.pth)")
+        sys.exit(1)
+
+    # Colors by dataset
+    if args.dataset_name == 'Pavia':
+        colors = 102
+    else:
+        colors = args.colors
+
+    # Build model from args (FIX 2)
+    net = SSPSR(
+        n_subs=getattr(args, "n_subs", 8),
+        n_ovls=getattr(args, "n_ovls", 2),
+        n_colors=colors,
+        n_blocks=getattr(args, "n_blocks", 3),
+        n_feats=getattr(args, "n_feats", 256),
+        n_scale=args.n_scale,
+        res_scale=0.1, use_share=True, conv=default_conv
+    )
+    # Load weights (supports checkpoints saved via save_checkpoint or raw state_dict)
+    state = torch.load(args.weights, map_mode='cpu' if device.type == 'cpu' else None)
+    if isinstance(state, dict) and "model" in state:
+        # our checkpoint format
+        state = state["model"].state_dict() if hasattr(state["model"], "state_dict") else state["model"]
+    net.load_state_dict(state if isinstance(state, dict) else state)
+    net = net.to(device).eval()
+
     print('===> Loading testset')
-    test_set = HSTestData(test_data_dir, colors=args.colors)
+    test_set = HSTestData(test_data_dir, colors=colors)
     test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
+
     print('===> Start testing')
+    run_test_loop(net, args, device, test_data_dir, result_path)
+
+
+def run_test_loop(net, args, device, test_data_dir, result_path):
     with torch.no_grad():
-        epoch_meter = meter.AverageValueMeter()
-        epoch_meter.reset()
-        # loading model
-        model = SSPSR(n_subs=n_subs, n_ovls=n_ovls, n_colors=colors, n_blocks=n_blocks, n_feats=n_feats, n_scale=n_scale, res_scale=0.1, use_share=True, conv=default_conv)
-        state_dict = torch.load(model_name)
-        model.load_state_dict(state_dict)
-        model.to(device).eval()
-        mse_loss = torch.nn.MSELoss()
-        output = torch.tensor([])
+        output = []
+        test_number = 0  # FIX 2
+        mat = [4, 7, 3]
+
+        test_set = HSTestData(test_data_dir, colors=args.colors)
+        test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
+
         for i, (ms, lms, gt) in enumerate(test_loader):
-            # compute output
             ms, lms, gt = ms.to(device), lms.to(device), gt.to(device)
-            # y = model(ms)
-            y = model(ms, lms)
-            y, gt = y.squeeze().cpu().numpy().transpose(1, 2, 0), gt.squeeze().cpu().numpy().transpose(1, 2, 0)
-            y = y[:gt.shape[0],:gt.shape[1],:] 
-            if i==0:
-                indices = quality_assessment(gt, y, data_range=1., ratio=4)
+            y = net(ms, lms)
+
+            # Save quick RGB-ish previews (FIX 3: safe dirs)
+            ensure_dir(result_path)
+            plt.imsave(os.path.join(result_path, 'gt.png'),
+                       gt.squeeze().cpu().numpy().transpose(1, 2, 0)[:, :, mat])
+            plt.imsave(os.path.join(result_path, 'ms.png'),
+                       ms.squeeze().cpu().numpy().transpose(1, 2, 0)[:, :, mat])
+            plt.imsave(os.path.join(result_path, 'y.png'),
+                       y.detach().squeeze().cpu().numpy().transpose(1, 2, 0)[:, :, mat])
+
+            # Metrics
+            y_np = y.squeeze().cpu().numpy().transpose(1, 2, 0)
+            gt_np = gt.squeeze().cpu().numpy().transpose(1, 2, 0)
+            y_np = y_np[:gt_np.shape[0], :gt_np.shape[1], :]
+            if i == 0:
+                indices = quality_assessment(gt_np, y_np, data_range=1., ratio=args.n_scale)
             else:
-                indices = sum_dict(indices, quality_assessment(gt, y, data_range=1., ratio=4))
-            output.append(y)
+                indices = sum_dict(indices, quality_assessment(gt_np, y_np, data_range=1., ratio=args.n_scale))
+            output.append(y_np)
             test_number += 1
-        for index in indices:
-            indices[index] = indices[index] / test_number
 
-    # save_dir = "/data/test.npy"
-    save_dir = result_path + model_title + '.npy'
-    np.save(save_dir, output)
-    print("Test finished, test results saved to .npy file at ", save_dir)
+        for k in indices:
+            indices[k] = indices[k] / max(test_number, 1)
+
+    # Save artifacts
+    np.save(os.path.join(result_path, "test.npy"), output)
+    print("Test finished, results saved to:", os.path.join(result_path, "test.npy"))
     print(indices)
+    with open(os.path.join(result_path, f"QI_{args.model_title if hasattr(args, 'model_title') else 'model'}_{time.strftime('%Y%m%d_%H%M%S')}.json"), "w") as f:
+        json.dump(indices, f, indent=2)
 
-    QIstr = model_title+'_'+str(time.ctime())+ ".txt"
-    json.dump(indices, open(QIstr, 'w'))
 
+# ---------------------------
+# Checkpoint
+# ---------------------------
 def save_checkpoint(args, model, epoch):
-    device = torch.device("cuda" if args.cuda else "cpu")
-    model.eval().cpu()
-    checkpoint_model_dir = './checkpoints/'
-    if not os.path.exists(checkpoint_model_dir):
-        os.makedirs(checkpoint_model_dir)
-    ckpt_model_filename = args.dataset_name + "_" + args.model_title + "_ckpt_epoch_" + str(epoch) + ".pth"
+    device = torch.device("cuda" if (bool(args.cuda) and torch.cuda.is_available()) else "cpu")
+    model = model.to("cpu").eval()
+    checkpoint_model_dir = ensure_dir('./checkpoints')
+    ckpt_model_filename = f"{args.dataset_name}_{args.model_title}_ckpt_epoch_{epoch}.pth"
     ckpt_model_path = os.path.join(checkpoint_model_dir, ckpt_model_filename)
     state = {"epoch": epoch, "model": model}
     torch.save(state, ckpt_model_path)
     model.to(device).train()
-    print("Checkpoint saved to {}".format(ckpt_model_path))
+    print(f"Checkpoint saved to {ckpt_model_path}")
 
 
 if __name__ == "__main__":
