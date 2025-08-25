@@ -1,4 +1,16 @@
-# Ignore everything in this directory
-*
-# Except this file
-!.gitignore
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Large data/models
+data/
+datasets/
+trained_model/
+cave_model/
+
+# System files
+.DS_Store
